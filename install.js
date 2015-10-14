@@ -14,7 +14,7 @@ var fs = require('fs')
 var helper = require('./lib/phantomjs')
 var kew = require('kew')
 var mkdirp = require('mkdirp')
-var ncp = require('ncp')
+var ncp = require('recursive-copy')
 var npmconf = require('npmconf')
 var path = require('path')
 var request = require('request')
@@ -27,6 +27,54 @@ var cdnUrl = process.env.PHANTOMJS_CDNURL || 'https://github.com/bprodoehl/phant
 var downloadUrl = cdnUrl + helper.version + '/phantomjs-' + helper.version + '-'
 
 var originalPath = process.env.PATH
+var downloadURLs = {
+    'win32': "https://bitbucket.org/ariya/phantomjs/downloads/phantomjs-2.0.0-windows.zip",
+    'bsd': "https://bitbucket.org/ariya/phantomjs/downloads/phantomjs-2.0.0-macosx.zip",
+    'linux': {
+        'Ubuntu 14.04': "https://github.com/laughingMan/phantomjs2.0/releases/download/2.0.0-20150731/phantomjs-2.0.0-20150731-u1404-x86_64.zip",
+        "Ubuntu 15.04": "https://github.com/laughingMan/phantomjs2.0/releases/download/2.0.0-20150731/phantomjs-2.0.0-20150731-u1504-x86_64.zip"
+    }
+};
+
+function getDownloadURL() {
+    var arch = process.arch;
+    var platform = process.platform;
+
+
+    switch (process.platform) {
+    case 'win32':
+        return kew.resolve(downloadURLs.win32);
+        break;
+    case 'darwin':
+    case 'openbsd':
+    case 'freebsd':
+        return kew.resolve(downloadURLs.bsd);
+        break;
+    case 'linux':
+            return kew.nfcall(fs.readFile, '/etc/lsb-release', 'utf8').then(function (data) {
+                var idRegex = /^DISTRIB_ID=(.*)$/m;
+                var versionRegex = /^DISTRIB_RELEASE=(.*)$/m;
+                var id = idRegex.exec(data);
+                var version = versionRegex.exec(data);
+
+                if (!id || !version) {
+                    return kew.reject("ERROR");
+                } else {
+                    id = id[1];
+                    version = version[1];
+                    var distro = id + ' ' + version;
+                    if (!downloadURLs.linux.hasOwnProperty(distro)) {
+                        return kew.reject("Don't know where to download phantomjs2 for " + distro);
+                    } else {
+                        return kew.resolve(downloadURLs.linux[distro]);
+                    }
+                }
+            });
+        break;
+    default:
+        return kew.reject("Cannot install phantomjs for platform: " + platform);
+    }
+}
 
 // If the process exits without going through exit(), then we did not complete.
 var validExit = false
@@ -103,29 +151,28 @@ whichDeferred.promise
   })
   .then(function (conf) {
     tmpPath = findSuitableTempDirectory(conf)
-
     // Can't use a global version so start a download.
-    if (process.platform === 'linux' && process.arch === 'x64') {
-      downloadUrl += 'linux-x86_64.zip'
-    } else if (process.platform === 'darwin' || process.platform === 'openbsd' || process.platform === 'freebsd') {
-      downloadUrl += 'macosx.zip'
-    } else {
-      console.error('Unexpected platform or architecture:', process.platform, process.arch)
-      exit(1)
-    }
-
-    var fileName = downloadUrl.split('/').pop()
-    var downloadedFile = path.join(tmpPath, fileName)
+    return getDownloadURL().then(function (downloadUrl) {
+        return kew.resolve({downloadUrl: downloadUrl, tmpPath: tmpPath, conf: conf});
+    });
+  })
+  .then(function (conf) {
+    var fileName = conf.downloadUrl.split('/').pop()
+    var downloadedFile = path.join(conf.tmpPath, fileName)
 
     // Start the install.
     if (!fs.existsSync(downloadedFile)) {
-      console.log('Downloading', downloadUrl)
+      console.log('Downloading', conf.downloadUrl)
       console.log('Saving to', downloadedFile)
-      return requestBinary(getRequestOptions(conf), downloadedFile)
+      return requestBinary(getRequestOptions(conf.downloadUrl, conf.conf), downloadedFile)
     } else {
       console.log('Download already available at', downloadedFile)
       return downloadedFile
     }
+  })
+  .fail(function (err) {
+    console.error(err);
+    exit(1);
   })
   .then(function (downloadedFile) {
     return extractDownload(downloadedFile)
@@ -135,8 +182,8 @@ whichDeferred.promise
   })
   .then(function () {
     var location = process.platform === 'win32' ?
-        path.join(pkgPath, 'phantomjs.exe') :
-        path.join(pkgPath, 'bin' ,'phantomjs')
+        path.join(pkgPath, 'bin', 'phantomjs.exe') :
+        path.join(pkgPath, 'bin', 'phantomjs')
     var relativeLocation = path.relative(libPath, location)
     writeLocationFile(relativeLocation)
 
@@ -200,7 +247,7 @@ function findSuitableTempDirectory(npmConf) {
 }
 
 
-function getRequestOptions(conf) {
+function getRequestOptions(downloadUrl, conf) {
   var options = {
     uri: downloadUrl,
     encoding: null, // Get response as a buffer
@@ -328,7 +375,7 @@ function copyIntoPlace(extractedPath, targetPath) {
     var files = fs.readdirSync(extractedPath)
     for (var i = 0; i < files.length; i++) {
       var file = path.join(extractedPath, files[i])
-      if (fs.statSync(file).isDirectory() && file.indexOf(helper.version) != -1) {
+      if (fs.statSync(file).isDirectory()) {
         console.log('Copying extracted folder', file, '->', targetPath)
         return kew.nfcall(ncp, file, targetPath)
       }
